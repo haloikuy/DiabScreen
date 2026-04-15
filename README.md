@@ -1,6 +1,6 @@
 # BRFSS Diabetes Risk Baseline
 
-Data repository: [HuggingFace]([https://github.com/Yiling-Ma/DiabScreen](https://huggingface.co/datasets/YilingMa/DiabScreen)).
+Data repository: [HuggingFace]([https://github.com/Yiling-Ma/DiabScreen](https://huggingface.co/datasets/YilingMa/DiabScreen).
 
 End-to-end baseline for a **binary diabetes risk** label using the CDC **Behavioral Risk Factor Surveillance System (BRFSS)** 2023 landline–cellphone combined dataset (`LLCP2023.XPT`). The pipeline lives in a single script: `diabetes_brfss_baseline.py`.
 
