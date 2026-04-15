@@ -1,5 +1,7 @@
 # BRFSS Diabetes Risk Baseline
 
+Source repository: [github.com/Yiling-Ma/DiabScreen](https://github.com/Yiling-Ma/DiabScreen).
+
 End-to-end baseline for a **binary diabetes risk** label using the CDC **Behavioral Risk Factor Surveillance System (BRFSS)** 2023 landline–cellphone combined dataset (`LLCP2023.XPT`). The pipeline lives in a single script: `diabetes_brfss_baseline.py`.
 
 ## What this project does
@@ -22,7 +24,7 @@ All file paths and column lists are configured at the top of `diabetes_brfss_bas
 1. Obtain **`LLCP2023.XPT`** from the CDC BRFSS site (2023 combined landline and cellphone data).
 2. Place it in the project root (default `DATA_PATH = "LLCP2023.XPT"`) or update `DATA_PATH` in the script.
 
-Large XPT files are listed in `.gitignore` so they are not committed by mistake.
+Large XPT files and the generated `outputs_brfss_diabetes/` directory are listed in `.gitignore` so they are not committed by mistake.
 
 Optional: the same file may be available from the Hugging Face dataset [`YilingMa/DiabScreen`](https://huggingface.co/datasets/YilingMa/DiabScreen) (check the dataset card for terms and versioning). You are responsible for complying with **CDC redistribution and citation** requirements when sharing or publishing results.
 
