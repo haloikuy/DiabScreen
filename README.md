@@ -13,8 +13,9 @@ End-to-end baseline for a **binary diabetes risk** label using the CDC **Behavio
   - **Logistic regression** with a small hyperparameter sweep over `C`.
   - **XGBoost** (optional): same idea over `max_depth` and `learning_rate` if `xgboost` is installed.
 - **Model selection**: best LR / XGB candidate by **validation AUPRC** (then full test evaluation with saved ROC/PR/confusion plots).
-- **Fairness-style reporting**: subgroup metrics under `outputs_brfss_diabetes/bias/`.
-- **Explainability** (optional): permutation importance, **SHAP**, and one **LIME** HTML example per model when those libraries are available.
+- **Fairness-style reporting**: input label-prevalence checks, subgroup metrics, readable subgroup labels, metric-gap summaries, and bias figures under `outputs_brfss_diabetes/bias/`.
+- **Explainability** (optional): permutation importance, one-hot **SHAP** summary plots, grouped-by-original-variable **SHAP** summary plots/importance bar plots/tables, and **LIME** local explanation HTML/PNG/CSV outputs when those libraries are available.
+- **Model artifacts**: final selected sklearn pipelines under `outputs_brfss_diabetes/models/`.
 
 All file paths and column lists are configured at the top of `diabetes_brfss_baseline.py` (e.g. `DATA_PATH`, `OUTPUT_DIR`, `FEATURE_COLS`).
 
@@ -62,11 +63,13 @@ Everything is written under **`outputs_brfss_diabetes/`** (created automatically
 
 | Path | Content |
 |------|---------|
-| `eda/` | EDA tables and summaries |
+| `eda/` | EDA tables and summaries, including simple and appendix-ready Table 1 outputs |
 | `figures/` | ROC, PR, calibration, confusion matrices, etc. |
 | `bias/` | Subgroup performance tables |
 | `explainability/` | Coefficients, permutation importance, SHAP plots, LIME HTML |
+| `models/` | Pickled final sklearn pipelines for selected models |
 | `model_comparison_metrics.csv` | Final test metrics per model |
+| `split_comparison_metrics.csv` | Train / validation / test metrics for selected final models |
 | `hyperparameter_sweep_results.csv` | One row per sweep candidate |
 | `*_test_predictions.csv` | Held-out test predictions for downstream analysis |
 | `run_config.json` | Serialized run configuration (features, splits, flags) |
@@ -89,7 +92,7 @@ Each hyperparameter candidate is logged under a **nested** child run (`nested=Tr
 - **Parent run**
   - **Parameters**: data path, label column, feature metadata, split sizes, prevalence, random seed, sweep config lists, flags for optional libs (`has_xgboost`, `has_shap`, `has_lime`), etc.
   - **Metrics**: flattened test metrics prefixed by model name (same convention as `log_metrics_to_mlflow` in code).
-  - **Artifacts**: `model_comparison_metrics.csv`, `hyperparameter_sweep_results.csv`, `run_config.json`, and the directories `eda/`, `figures/`, `bias/`, `explainability/` (uploaded as artifact folders).
+  - **Artifacts**: `model_comparison_metrics.csv`, `split_comparison_metrics.csv`, `hyperparameter_sweep_results.csv`, `run_config.json`, and the directories `eda/`, `figures/`, `bias/`, `explainability/`, and `models/` (uploaded as artifact folders).
 - **Child runs**
   - **Parameters**: `model_family` plus the sweep parameters for that candidate.
   - **Metrics**: AUROC, AUPRC, F1, precision, recall, specificity, Brier score, threshold for that candidate.

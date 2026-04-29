@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import json
+import pickle
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
@@ -36,7 +37,9 @@ from sklearn.inspection import permutation_importance
 try:
     from xgboost import XGBClassifier
     HAS_XGBOOST = True
-except ImportError:
+except Exception as exc:
+    print(f"XGBoost unavailable; skipping XGBoost baseline. Reason: {exc}")
+    XGBClassifier = None
     HAS_XGBOOST = False
 
 try:
@@ -72,8 +75,9 @@ EDA_DIR = os.path.join(OUTPUT_DIR, "eda")
 FIGURE_DIR = os.path.join(OUTPUT_DIR, "figures")
 BIAS_DIR = os.path.join(OUTPUT_DIR, "bias")
 EXPLAIN_DIR = os.path.join(OUTPUT_DIR, "explainability")
+MODEL_DIR = os.path.join(OUTPUT_DIR, "models")
 MLFLOW_DIR = os.path.join(OUTPUT_DIR, "mlruns")
-for output_path in [EDA_DIR, FIGURE_DIR, BIAS_DIR, EXPLAIN_DIR]:
+for output_path in [EDA_DIR, FIGURE_DIR, BIAS_DIR, EXPLAIN_DIR, MODEL_DIR]:
     os.makedirs(output_path, exist_ok=True)
 LR_SWEEP_CONFIGS = [
     {"C": 0.1},
@@ -117,6 +121,60 @@ LEAKAGE_COLS = [
 NUMERIC_COLS = ["_AGE80", "PHYSHLTH", "MENTHLTH", "ACEDRINK", "_BMI5"]
 CATEGORICAL_COLS = [c for c in FEATURE_COLS if c not in NUMERIC_COLS]
 SUBGROUP_COLS = ["SEXVAR", "_RACEGR3", "_EDUCAG", "INCOME3", "age_group"]
+
+VALUE_LABELS = {
+    "SEXVAR": {
+        1.0: "Male",
+        2.0: "Female",
+    },
+    "_RACEGR3": {
+        1.0: "White only, non-Hispanic",
+        2.0: "Black only, non-Hispanic",
+        3.0: "Other race only, non-Hispanic",
+        4.0: "Multiracial, non-Hispanic",
+        5.0: "Hispanic",
+    },
+    "_EDUCAG": {
+        1.0: "Did not graduate high school",
+        2.0: "Graduated high school",
+        3.0: "Attended college/technical school",
+        4.0: "Graduated college/technical school",
+    },
+    "INCOME3": {
+        1.0: "<$10k",
+        2.0: "$10k-<$15k",
+        3.0: "$15k-<$20k",
+        4.0: "$20k-<$25k",
+        5.0: "$25k-<$35k",
+        6.0: "$35k-<$50k",
+        7.0: "$50k-<$100k",
+        8.0: "$100k-<$200k",
+        9.0: "$200k+",
+    },
+}
+
+VARIABLE_LABELS = {
+    "SEXVAR": "Sex",
+    "_AGE80": "Age",
+    "_RACEGR3": "Race group",
+    "_EDUCAG": "Education",
+    "INCOME3": "Income",
+    "GENHLTH": "General health",
+    "PHYSHLTH": "Physical health days",
+    "MENTHLTH": "Mental health days",
+    "PRIMINS1": "Primary insurance",
+    "PERSDOC3": "Personal doctor",
+    "MEDCOST1": "Medical cost barrier",
+    "CHECKUP1": "Recent checkup",
+    "EXERANY2": "Exercise in past month",
+    "_SMOKER3": "Smoking status",
+    "ACEDRINK": "Alcohol drinks",
+    "BPHIGH6": "High blood pressure",
+    "BPMEDS1": "Blood pressure medication",
+    "CHOLCHK3": "Cholesterol check",
+    "_BMI5": "BMI",
+    "age_group": "Age group",
+}
 
 
 @dataclass
@@ -329,6 +387,144 @@ def create_table_one(data: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def format_mean_sd(series: pd.Series, latex: bool = False) -> str:
+    """Format a numeric variable as mean +/- SD."""
+    values = series.dropna()
+    if values.empty:
+        return ""
+    separator = r" $\pm$ " if latex else " +/- "
+    return f"{values.mean():.1f}{separator}{values.std():.1f}"
+
+
+def format_count_pct(series: pd.Series, value: object) -> str:
+    """Format a categorical level as n (%), using the full group denominator."""
+    denom = len(series)
+    count = (series == value).sum() if not pd.isna(value) else series.isna().sum()
+    pct = count / denom if denom > 0 else np.nan
+    return f"{int(count):,} ({pct:.1%})" if pd.notna(pct) else f"{int(count):,} (-)"
+
+
+def category_display_label(col: str, value: object) -> str:
+    """Return a readable category label for Table 1."""
+    if pd.isna(value):
+        return "Missing"
+    if col == "age_group":
+        return str(value)
+    return readable_group_label(col, value)
+
+
+def category_sort_key(value: object) -> Tuple[int, str]:
+    """Sort numeric-coded categories numerically and put missing last."""
+    if pd.isna(value):
+        return (1, "")
+    try:
+        return (0, f"{float(value):010.3f}")
+    except (TypeError, ValueError):
+        return (0, str(value))
+
+
+def latex_escape(value: object) -> str:
+    """Escape a small set of LaTeX special characters for table cells."""
+    text = str(value)
+    replacements = {
+        "\\": r"\textbackslash{}",
+        "&": r"\&",
+        "%": r"\%",
+        "$": r"\$",
+        "#": r"\#",
+        "_": r"\_",
+        "{": r"\{",
+        "}": r"\}",
+        "~": r"\textasciitilde{}",
+        "^": r"\textasciicircum{}",
+        "<": r"$<$",
+        ">": r"$>$",
+    }
+    return "".join(replacements.get(char, char) for char in text)
+
+
+def create_full_table_one(data: pd.DataFrame) -> pd.DataFrame:
+    """Create appendix-ready Table 1 with all selected feature levels by outcome."""
+    rows = []
+    no_diabetes_label = f"No diabetes (y=0, n={int((data['y'] == 0).sum()):,})"
+    diabetes_label = f"Diabetes (y=1, n={int((data['y'] == 1).sum()):,})"
+    overall_label = f"Overall (n={len(data):,})"
+
+    for col in FEATURE_COLS + ["age_group"]:
+        variable_label = VARIABLE_LABELS.get(col, col)
+        if col in NUMERIC_COLS:
+            rows.append({
+                "variable": f"{variable_label}, mean +/- SD",
+                "level": "",
+                no_diabetes_label: format_mean_sd(data.loc[data["y"] == 0, col]),
+                diabetes_label: format_mean_sd(data.loc[data["y"] == 1, col]),
+                overall_label: format_mean_sd(data[col]),
+            })
+            continue
+
+        rows.append({
+            "variable": variable_label,
+            "level": "",
+            no_diabetes_label: "",
+            diabetes_label: "",
+            overall_label: "",
+        })
+
+        values = data[col]
+        nonmissing_levels = sorted(
+            values.dropna().unique(),
+            key=category_sort_key,
+        )
+        levels = list(nonmissing_levels)
+        if values.isna().any():
+            levels.append(np.nan)
+
+        for level in levels:
+            rows.append({
+                "variable": "",
+                "level": category_display_label(col, level),
+                no_diabetes_label: format_count_pct(data.loc[data["y"] == 0, col], level),
+                diabetes_label: format_count_pct(data.loc[data["y"] == 1, col], level),
+                overall_label: format_count_pct(data[col], level),
+            })
+
+    return pd.DataFrame(rows)
+
+
+def save_full_table_one_latex(table_one: pd.DataFrame, save_path: str) -> None:
+    """Write Table 1 as a booktabs-style LaTeX table for appendix use."""
+    columns = list(table_one.columns)
+    with open(save_path, "w") as f:
+        f.write("% Requires \\usepackage{booktabs}\n")
+        f.write("\\begin{table}[htbp]\n")
+        f.write("\\centering\n")
+        f.write("\\small\n")
+        f.write("\\caption{Cohort characteristics stratified by diabetes status.}\n")
+        f.write("\\label{tab:full_table1}\n")
+        f.write("\\begin{tabular}{lllll}\n")
+        f.write("\\toprule\n")
+        f.write(" & ".join(latex_escape(col) for col in columns) + r" \\" + "\n")
+        f.write("\\midrule\n")
+        for _, row in table_one.iterrows():
+            is_section = row["level"] == "" and row.iloc[2:].eq("").all()
+            if is_section:
+                f.write("\\midrule\n")
+                f.write(r"\textbf{" + latex_escape(row["variable"]) + r"} &  &  &  &  \\" + "\n")
+                continue
+
+            cells = [row[col] for col in columns]
+            if row["level"] != "":
+                cells[1] = r"\hspace{1em}" + latex_escape(row["level"])
+                cells[0] = ""
+                escaped_cells = [latex_escape(cells[0]), cells[1]] + [latex_escape(cell) for cell in cells[2:]]
+            else:
+                escaped_cells = [latex_escape(cell) for cell in cells]
+            f.write(" & ".join(escaped_cells) + r" \\" + "\n")
+        f.write("\\bottomrule\n")
+        f.write("\\end{tabular}\n")
+        f.write("\\end{table}\n")
+
+
 def plot_missingness(miss: pd.DataFrame, save_path: str, top_n: int = 15) -> None:
     plot_df = miss.head(top_n).iloc[::-1]
     plt.figure(figsize=(8, 6))
@@ -377,6 +573,13 @@ def generate_eda_outputs(data: pd.DataFrame) -> None:
     """Save EDA artifacts used in the report."""
     table_one = create_table_one(data)
     table_one.to_csv(os.path.join(EDA_DIR, "table1_cohort_summary.csv"), index=False)
+
+    full_table_one = create_full_table_one(data)
+    full_table_one.to_csv(os.path.join(EDA_DIR, "full_table1_cohort_characteristics.csv"), index=False)
+    save_full_table_one_latex(
+        full_table_one,
+        os.path.join(EDA_DIR, "full_table1_cohort_characteristics.tex"),
+    )
 
     miss = missingness_report(data)
     miss.to_csv(os.path.join(EDA_DIR, "missingness_report.csv"), index=False)
@@ -510,6 +713,23 @@ def plot_confusion(y_true: pd.Series, y_prob: np.ndarray, threshold: float, titl
     plt.close()
 
 
+def readable_group_label(subgroup_col: str, group_value: object) -> str:
+    """Convert selected BRFSS coded subgroup values to report-friendly labels."""
+    if pd.isna(group_value) or str(group_value).lower() == "nan":
+        return "Missing"
+
+    if subgroup_col == "age_group":
+        return str(group_value)
+
+    label_map = VALUE_LABELS.get(subgroup_col, {})
+    try:
+        numeric_value = float(group_value)
+    except (TypeError, ValueError):
+        return str(group_value)
+
+    return label_map.get(numeric_value, str(group_value))
+
+
 def subgroup_metrics(
     df_eval: pd.DataFrame,
     subgroup_col: str,
@@ -525,6 +745,7 @@ def subgroup_metrics(
         try:
             m = compute_metrics(group_df[label_col], group_df[prob_col], threshold=threshold)
             m["group"] = group_value
+            m["group_label"] = readable_group_label(subgroup_col, group_value)
             m["n"] = len(group_df)
             rows.append(m)
         except Exception:
@@ -532,11 +753,124 @@ def subgroup_metrics(
     return pd.DataFrame(rows)
 
 
+def plot_subgroup_metric(
+    subgroup_df: pd.DataFrame,
+    subgroup_col: str,
+    metric: str,
+    title: str,
+    save_path: str,
+) -> None:
+    """Save a subgroup metric bar plot for bias assessment figures."""
+    if subgroup_df.empty or metric not in subgroup_df.columns:
+        return
+
+    plot_df = subgroup_df.sort_values(metric).copy()
+    height = max(4.0, 0.45 * len(plot_df) + 1.5)
+
+    plt.figure(figsize=(8, height))
+    plt.barh(plot_df["group_label"].astype(str), plot_df[metric])
+    plt.xlabel(metric)
+    plt.ylabel(subgroup_col)
+    plt.title(title)
+    x_lower, x_upper = metric_axis_limits(plot_df[metric].tolist(), lower_zero=False, pad=0.04)
+    plt.xlim(x_lower, min(1.05, x_upper + 0.02))
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300)
+    plt.close()
+
+
+def ordered_subgroup_df(subgroup_df: pd.DataFrame, subgroup_col: str) -> pd.DataFrame:
+    """Return subgroup rows in a report-friendly order."""
+    if subgroup_df.empty:
+        return subgroup_df
+    subgroup_df = subgroup_df[subgroup_df["group_label"].astype(str) != "Missing"].copy()
+    if subgroup_df.empty:
+        return subgroup_df
+
+    order_map = {}
+    if subgroup_col == "age_group":
+        order_map = {"18-34": 0, "35-49": 1, "50-64": 2, "65-80": 3}
+    elif subgroup_col == "SEXVAR":
+        order_map = {"Female": 0, "Male": 1}
+
+    if not order_map:
+        return subgroup_df.sort_values("group_label")
+
+    return (
+        subgroup_df.assign(_order=subgroup_df["group_label"].map(order_map).fillna(999))
+        .sort_values(["_order", "group_label"])
+        .drop(columns=["_order"])
+    )
+
+
+def metric_axis_limits(values: List[float], lower_zero: bool = False, pad: float = 0.06) -> Tuple[float, float]:
+    """Choose readable y-axis limits for bounded performance metrics."""
+    clean_values = pd.Series(values, dtype="float64").replace([np.inf, -np.inf], np.nan).dropna()
+    if clean_values.empty:
+        return 0.0, 1.0
+
+    min_value = float(clean_values.min())
+    max_value = float(clean_values.max())
+    value_range = max_value - min_value
+    padding = max(pad, value_range * 0.25)
+
+    lower = 0.0 if lower_zero else max(0.0, min_value - padding)
+    upper = min(1.0, max_value + padding)
+    if upper - lower < 0.12:
+        midpoint = (upper + lower) / 2
+        lower = 0.0 if lower_zero else max(0.0, midpoint - 0.06)
+        upper = min(1.0, midpoint + 0.06)
+
+    if upper <= lower:
+        upper = min(1.0, lower + 0.1)
+    return lower, upper
+
+
+def save_input_bias_outputs(data: pd.DataFrame) -> None:
+    """Assess label prevalence across input subgroups before model training."""
+    age_df = (
+        data.groupby("age_group", dropna=False)["y"]
+        .agg(["mean", "count", "sum"])
+        .reset_index()
+        .rename(columns={"mean": "diabetes_prevalence", "count": "n", "sum": "n_diabetes"})
+    )
+    age_df["age_group_label"] = age_df["age_group"].astype(str)
+    age_df = ordered_subgroup_df(
+        age_df.rename(columns={"age_group_label": "group_label"}),
+        "age_group",
+    )
+    age_df.to_csv(os.path.join(BIAS_DIR, "input_age_group_label_prevalence.csv"), index=False)
+
+    plt.figure(figsize=(8.5, 5.2))
+    ax = plt.gca()
+    bars = ax.bar(age_df["group_label"], age_df["diabetes_prevalence"], color="#3ba3cf", edgecolor="#2c6f8f")
+    for bar, prevalence, n in zip(bars, age_df["diabetes_prevalence"], age_df["n"]):
+        ax.text(
+            bar.get_x() + bar.get_width() / 2,
+            bar.get_height() + 0.01,
+            f"{prevalence:.2%}\n(n={int(n):,})",
+            ha="center",
+            va="bottom",
+            fontsize=8,
+        )
+
+    ax.set_ylabel("Observed diabetes prevalence")
+    ax.set_xlabel("Age group")
+    ax.set_title("Observed Diabetes Label Prevalence by Age Group", fontweight="bold")
+    ax.set_ylim(0, min(1.0, max(age_df["diabetes_prevalence"].max() * 1.25, 0.05)))
+    ax.grid(axis="y", alpha=0.25, linestyle="-")
+    ax.set_axisbelow(True)
+    plt.tight_layout()
+    plt.savefig(os.path.join(BIAS_DIR, "input_age_group_label_prevalence.png"), dpi=300, bbox_inches="tight")
+    plt.close()
+
+
 def save_subgroup_outputs(
     eval_df: pd.DataFrame,
     model_name: str,
     threshold: float,
 ) -> None:
+    summary_rows = []
     for subgroup_col in SUBGROUP_COLS:
         subgroup_df = subgroup_metrics(
             eval_df,
@@ -549,6 +883,244 @@ def save_subgroup_outputs(
             os.path.join(BIAS_DIR, f"{model_name}_subgroup_{subgroup_col}.csv"),
             index=False,
         )
+        for metric in ["auroc", "auprc", "recall_sensitivity", "specificity", "precision_ppv"]:
+            if subgroup_df.empty or metric not in subgroup_df.columns:
+                continue
+            summary_rows.append({
+                "model": model_name,
+                "subgroup": subgroup_col,
+                "metric": metric,
+                "min": subgroup_df[metric].min(),
+                "max": subgroup_df[metric].max(),
+                "range": subgroup_df[metric].max() - subgroup_df[metric].min(),
+                "min_group": subgroup_df.loc[subgroup_df[metric].idxmin(), "group_label"],
+                "max_group": subgroup_df.loc[subgroup_df[metric].idxmax(), "group_label"],
+            })
+
+        if subgroup_col in ["_RACEGR3", "INCOME3"]:
+            plot_subgroup_metric(
+                subgroup_df,
+                subgroup_col,
+                "auroc",
+                f"{model_name}: AUROC by {subgroup_col}",
+                os.path.join(BIAS_DIR, f"{model_name}_{subgroup_col}_auroc.png"),
+            )
+            plot_subgroup_metric(
+                subgroup_df,
+                subgroup_col,
+                "recall_sensitivity",
+                f"{model_name}: Sensitivity by {subgroup_col}",
+                os.path.join(BIAS_DIR, f"{model_name}_{subgroup_col}_sensitivity.png"),
+            )
+
+    if summary_rows:
+        pd.DataFrame(summary_rows).to_csv(
+            os.path.join(BIAS_DIR, f"{model_name}_subgroup_metric_ranges.csv"),
+            index=False,
+        )
+
+
+def display_model_name(model_name: str) -> str:
+    label_map = {
+        "logistic_regression": "Logistic Regression",
+        "xgboost": "XGBoost",
+    }
+    return label_map.get(model_name, model_name)
+
+
+def combined_subgroup_tables(
+    eval_datasets: Dict[str, pd.DataFrame],
+    thresholds: Dict[str, float],
+    subgroup_col: str,
+) -> Dict[str, pd.DataFrame]:
+    tables = {}
+    for model_name, eval_df in eval_datasets.items():
+        if model_name not in thresholds:
+            continue
+        tables[model_name] = subgroup_metrics(
+            eval_df,
+            subgroup_col=subgroup_col,
+            prob_col="y_prob",
+            label_col="y",
+            threshold=thresholds[model_name],
+        )
+    return tables
+
+
+def plot_combined_subgroup_performance_metrics(
+    subgroup_tables: Dict[str, pd.DataFrame],
+    subgroup_col: str,
+    save_path: str,
+) -> None:
+    """Plot age/sex subgroup metrics for all available models in one figure."""
+    metric_labels = [
+        ("auroc", "AUROC"),
+        ("recall_sensitivity", "Sensitivity"),
+        ("specificity", "Specificity"),
+        ("precision_ppv", "PPV"),
+        ("fpr", "FPR"),
+        ("fnr", "FNR"),
+    ]
+    if not subgroup_tables:
+        return
+
+    readable_col = "Sex" if subgroup_col == "SEXVAR" else "Age group"
+    palette = ["#3ba3cf", "#f47c51", "#6fbf73", "#b07cc6"]
+    n_models = len(subgroup_tables)
+    fig, axes = plt.subplots(
+        1,
+        n_models,
+        figsize=(6.6 * n_models, 5.6),
+        sharey=True,
+        squeeze=False,
+    )
+    x = np.arange(len(metric_labels))
+    all_values = []
+
+    for ax, (model_name, subgroup_df) in zip(axes[0], subgroup_tables.items()):
+        if subgroup_df.empty:
+            continue
+        plot_df = ordered_subgroup_df(subgroup_df, subgroup_col).copy()
+        if plot_df.empty:
+            continue
+        plot_df["fpr"] = 1.0 - plot_df["specificity"]
+        plot_df["fnr"] = 1.0 - plot_df["recall_sensitivity"]
+        groups = plot_df["group_label"].astype(str).tolist()
+        width = min(0.8 / max(len(groups), 1), 0.22)
+
+        for i, (_, row) in enumerate(plot_df.iterrows()):
+            values = [row[metric] for metric, _ in metric_labels]
+            all_values.extend(values)
+            offsets = x + (i - (len(groups) - 1) / 2) * width
+            bars = ax.bar(
+                offsets,
+                values,
+                width=width,
+                label=str(row["group_label"]),
+                color=palette[i % len(palette)],
+                edgecolor="#666666",
+                linewidth=0.6,
+                alpha=0.95,
+            )
+            for bar, value in zip(bars, values):
+                if pd.notna(value):
+                    ax.text(
+                        bar.get_x() + bar.get_width() / 2,
+                        bar.get_height() + 0.01,
+                        f"{value:.2f}",
+                        ha="center",
+                        va="bottom",
+                        fontsize=7,
+                        rotation=90 if len(groups) > 3 else 0,
+                    )
+
+        ax.set_title(display_model_name(model_name), fontweight="bold")
+        ax.set_xlabel("Performance Metric")
+        ax.set_xticks(x)
+        ax.set_xticklabels([label for _, label in metric_labels], rotation=25, ha="right")
+        ax.grid(axis="y", alpha=0.25, linestyle="-")
+        ax.set_axisbelow(True)
+        ax.legend(title=readable_col, fontsize=8, frameon=True)
+
+    y_lower, y_upper = metric_axis_limits(all_values, lower_zero=False, pad=0.05)
+    y_upper = min(1.12, y_upper + 0.04)
+    for ax in axes[0]:
+        ax.set_ylim(y_lower, y_upper)
+
+    axes[0][0].set_ylabel("Score")
+    fig.suptitle(f"{readable_col} Subgroup Performance Metrics by Model", y=1.02, fontweight="bold")
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_combined_subgroup_metric_line(
+    subgroup_tables: Dict[str, pd.DataFrame],
+    subgroup_col: str,
+    metric: str,
+    metric_label: str,
+    save_path: str,
+) -> None:
+    """Plot AUROC or sensitivity by subgroup with all models on one axis."""
+    if not subgroup_tables:
+        return
+
+    readable_col = "Sex" if subgroup_col == "SEXVAR" else "Age group"
+    plt.figure(figsize=(8.5, 5.0))
+    ax = plt.gca()
+    colors = {
+        "logistic_regression": "#3ba3cf",
+        "xgboost": "#f47c51",
+    }
+    all_values = []
+    for model_name, subgroup_df in subgroup_tables.items():
+        if subgroup_df.empty or metric not in subgroup_df.columns:
+            continue
+        plot_df = ordered_subgroup_df(subgroup_df, subgroup_col)
+        if plot_df.empty:
+            continue
+        all_values.extend(plot_df[metric].tolist())
+        ax.plot(
+            plot_df["group_label"].astype(str),
+            plot_df[metric],
+            marker="o",
+            linewidth=2,
+            color=colors.get(model_name),
+            label=display_model_name(model_name),
+        )
+        for _, row in plot_df.iterrows():
+            if pd.notna(row[metric]):
+                ax.text(str(row["group_label"]), row[metric] + 0.008, f"{row[metric]:.2f}", ha="center", fontsize=8)
+
+    ax.set_title(f"{metric_label} by {readable_col}", fontweight="bold")
+    ax.set_xlabel(readable_col)
+    ax.set_ylabel(metric_label)
+    y_lower, y_upper = metric_axis_limits(all_values, lower_zero=False, pad=0.035)
+    ax.set_ylim(y_lower, min(1.05, y_upper + 0.03))
+    ax.grid(axis="y", alpha=0.25, linestyle="-")
+    ax.set_axisbelow(True)
+    ax.legend(title="Model", frameon=True)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close()
+
+
+def save_combined_subgroup_outputs(
+    eval_datasets: Dict[str, pd.DataFrame],
+    thresholds: Dict[str, float],
+) -> None:
+    """Save report-ready subgroup comparison figures with all models in each plot."""
+    for subgroup_col in ["age_group", "SEXVAR"]:
+        tables = combined_subgroup_tables(eval_datasets, thresholds, subgroup_col)
+        if not tables:
+            continue
+        plot_combined_subgroup_performance_metrics(
+            tables,
+            subgroup_col,
+            os.path.join(BIAS_DIR, f"combined_{subgroup_col}_performance_metrics.png"),
+        )
+        plot_combined_subgroup_metric_line(
+            tables,
+            subgroup_col,
+            "auroc",
+            "AUROC",
+            os.path.join(BIAS_DIR, f"combined_{subgroup_col}_auroc_line.png"),
+        )
+        plot_combined_subgroup_metric_line(
+            tables,
+            subgroup_col,
+            "recall_sensitivity",
+            "Sensitivity",
+            os.path.join(BIAS_DIR, f"combined_{subgroup_col}_sensitivity_line.png"),
+        )
+
+
+def save_model_artifact(model: Pipeline, model_name: str) -> str:
+    """Persist the final sklearn pipeline for reproducibility and MLflow artifacts."""
+    save_path = os.path.join(MODEL_DIR, f"{model_name}_pipeline.pkl")
+    with open(save_path, "wb") as f:
+        pickle.dump(model, f)
+    return save_path
 
 
 def save_logistic_coefficients(model: Pipeline, save_path: str) -> None:
@@ -588,6 +1160,52 @@ def save_permutation_importance(
     )
 
 
+def original_feature_name(transformed_feature_name: str) -> str:
+    """Map transformed one-hot/scaled feature names back to the original BRFSS variable."""
+    name = transformed_feature_name
+    if "__" in name:
+        name = name.split("__", 1)[1]
+
+    if name in FEATURE_COLS:
+        return name
+
+    for col in sorted(CATEGORICAL_COLS, key=len, reverse=True):
+        if name == col or name.startswith(f"{col}_"):
+            return col
+
+    return name
+
+
+def normalize_shap_array(shap_values: object) -> np.ndarray:
+    """Return a 2D SHAP array for the positive class when needed."""
+    if isinstance(shap_values, list):
+        shap_values = shap_values[-1]
+    elif hasattr(shap_values, "values"):
+        shap_values = shap_values.values
+
+    shap_array = np.asarray(shap_values)
+    if shap_array.ndim == 3:
+        shap_array = shap_array[:, :, -1]
+    return shap_array
+
+
+def grouped_shap_importance(
+    shap_array: np.ndarray,
+    transformed_feature_names: np.ndarray,
+) -> pd.DataFrame:
+    """Aggregate one-hot SHAP magnitudes back to original BRFSS variables."""
+    original_names = [original_feature_name(name) for name in transformed_feature_names]
+    rows = []
+    for col in [feature for feature in FEATURE_COLS if feature in original_names]:
+        idx = [i for i, original in enumerate(original_names) if original == col]
+        rows.append({
+            "feature": col,
+            "mean_abs_shap": np.abs(shap_array[:, idx]).sum(axis=1).mean(),
+            "n_transformed_columns": len(idx),
+        })
+    return pd.DataFrame(rows).sort_values("mean_abs_shap", ascending=False)
+
+
 def save_shap_outputs(
     model: Pipeline,
     X_background: pd.DataFrame,
@@ -619,6 +1237,37 @@ def save_shap_outputs(
         else:
             explainer = shap.Explainer(predictor.predict_proba, background_sample, feature_names=feature_names)
             shap_values = explainer(explain_sample)
+
+        shap_array = normalize_shap_array(shap_values)
+        mean_abs_shap = np.abs(shap_array).mean(axis=0)
+        shap_importance_df = pd.DataFrame({
+            "feature": feature_names,
+            "original_feature": [original_feature_name(name) for name in feature_names],
+            "mean_abs_shap": mean_abs_shap,
+        }).sort_values("mean_abs_shap", ascending=False)
+        shap_importance_df.to_csv(
+            os.path.join(EXPLAIN_DIR, f"{model_name}_shap_top_features.csv"),
+            index=False,
+        )
+
+        grouped_importance_df = grouped_shap_importance(shap_array, feature_names)
+        grouped_importance_df.to_csv(
+            os.path.join(EXPLAIN_DIR, f"{model_name}_shap_grouped_top_features.csv"),
+            index=False,
+        )
+
+        plt.figure(figsize=(8, 6))
+        plot_df = grouped_importance_df.head(15).iloc[::-1]
+        plt.barh(plot_df["feature"], plot_df["mean_abs_shap"])
+        plt.xlabel("Mean summed absolute SHAP value")
+        plt.title(f"{model_name} grouped SHAP importance")
+        plt.tight_layout()
+        plt.savefig(
+            os.path.join(EXPLAIN_DIR, f"{model_name}_shap_grouped_importance.png"),
+            dpi=300,
+            bbox_inches="tight",
+        )
+        plt.close()
 
         plt.figure()
         shap.summary_plot(shap_values, explain_sample, feature_names=feature_names, show=False)
@@ -662,7 +1311,21 @@ def save_lime_example(
             predictor.predict_proba,
             num_features=10,
         )
-        explanation.save_to_file(os.path.join(EXPLAIN_DIR, f"{model_name}_lime_example.html"))
+        pd.DataFrame(
+            explanation.as_list(),
+            columns=["feature_condition", "local_weight"],
+        ).to_csv(
+            os.path.join(EXPLAIN_DIR, f"{model_name}_lime_example_weights.csv"),
+            index=False,
+        )
+        lime_fig = explanation.as_pyplot_figure()
+        lime_fig.tight_layout()
+        lime_fig.savefig(
+            os.path.join(EXPLAIN_DIR, f"{model_name}_lime_example.png"),
+            dpi=300,
+            bbox_inches="tight",
+        )
+        plt.close(lime_fig)
     except Exception as exc:
         print(f"Skipping LIME for {model_name}: {exc}")
 
@@ -768,6 +1431,24 @@ def evaluate_model(
     return metrics_df, best_threshold, test_prob
 
 
+def evaluate_model_on_splits(
+    model: Pipeline,
+    split_data: Dict[str, Tuple[pd.DataFrame, pd.Series]],
+    threshold: float,
+    model_name: str,
+) -> pd.DataFrame:
+    """Evaluate a fitted model on train/validation/test splits using one threshold."""
+    rows = []
+    for split_name, (X_split, y_split) in split_data.items():
+        y_prob = model.predict_proba(X_split)[:, 1]
+        rows.append({
+            "model": model_name,
+            "split": split_name,
+            **compute_metrics(y_split, y_prob, threshold=threshold),
+        })
+    return pd.DataFrame(rows)
+
+
 def run_sweep_candidate(
     model_family: str,
     model_label: str,
@@ -792,22 +1473,56 @@ def run_sweep_candidate(
     else:
         raise ValueError(f"Unsupported model family: {model_family}")
 
-    metrics_df, threshold, test_prob = evaluate_model(
-        model,
-        X_valid,
-        y_valid,
-        X_test,
-        y_test,
-        model_label,
-        save_artifacts=False,
-    )
-    metrics_df["model_family"] = model_family
-    metrics_df["config"] = json.dumps(params, sort_keys=True)
+    valid_prob = model.predict_proba(X_valid)[:, 1]
+    threshold = choose_threshold_by_f1(y_valid, valid_prob)
+    valid_metrics = compute_metrics(y_valid, valid_prob, threshold=threshold)
+
+    test_prob = model.predict_proba(X_test)[:, 1]
+    test_metrics = compute_metrics(y_test, test_prob, threshold=threshold)
+
+    metrics_df = pd.DataFrame([{
+        "model": model_label,
+        "model_family": model_family,
+        "config": json.dumps(params, sort_keys=True),
+        "threshold_selection_split": "validation",
+        "validation_auroc": valid_metrics["auroc"],
+        "validation_auprc": valid_metrics["auprc"],
+        "validation_f1": valid_metrics["f1"],
+        "validation_precision_ppv": valid_metrics["precision_ppv"],
+        "validation_recall_sensitivity": valid_metrics["recall_sensitivity"],
+        "validation_specificity": valid_metrics["specificity"],
+        "validation_brier_score": valid_metrics["brier_score"],
+        "auroc": test_metrics["auroc"],
+        "auprc": test_metrics["auprc"],
+        "f1": test_metrics["f1"],
+        "precision_ppv": test_metrics["precision_ppv"],
+        "recall_sensitivity": test_metrics["recall_sensitivity"],
+        "specificity": test_metrics["specificity"],
+        "brier_score": test_metrics["brier_score"],
+        "threshold": threshold,
+    }])
 
     if HAS_MLFLOW:
         with mlflow.start_run(run_name=model_label, nested=True):
             log_params_to_mlflow({"model_family": model_family, **params})
-            log_metrics_to_mlflow(metrics_df[["model", "auroc", "auprc", "f1", "precision_ppv", "recall_sensitivity", "specificity", "brier_score", "threshold"]])
+            log_metrics_to_mlflow(metrics_df[[
+                "model",
+                "validation_auroc",
+                "validation_auprc",
+                "validation_f1",
+                "validation_precision_ppv",
+                "validation_recall_sensitivity",
+                "validation_specificity",
+                "validation_brier_score",
+                "auroc",
+                "auprc",
+                "f1",
+                "precision_ppv",
+                "recall_sensitivity",
+                "specificity",
+                "brier_score",
+                "threshold",
+            ]])
 
     return model, metrics_df, threshold, test_prob
 
@@ -839,6 +1554,7 @@ def main() -> None:
 
     # 6) EDA outputs
     generate_eda_outputs(data)
+    save_input_bias_outputs(data)
 
     miss = missingness_report(data)
     print("\nTop missingness:")
@@ -907,6 +1623,7 @@ def main() -> None:
     )
     lr_metrics["selected_params"] = json.dumps(best_lr_params, sort_keys=True)
     thresholds[lr_model_name] = lr_thr
+    lr_model_path = save_model_artifact(best_lr_model, lr_model_name)
 
     eval_lr = X_test.copy()
     eval_lr["age_group"] = data.loc[X_test.index, "age_group"].astype(str).values
@@ -952,6 +1669,7 @@ def main() -> None:
         xgb_metrics["selected_params"] = json.dumps(best_xgb_params, sort_keys=True)
         all_metrics.append(xgb_metrics)
         thresholds["xgboost"] = xgb_thr
+        xgb_model_path = save_model_artifact(xgb_model, "xgboost")
 
         eval_xgb = X_test.copy()
         eval_xgb["age_group"] = data.loc[X_test.index, "age_group"].astype(str).values
@@ -971,6 +1689,21 @@ def main() -> None:
     print("\n=== Final Test Metrics ===")
     print(results)
 
+    split_data = {
+        "train": (X_train, y_train),
+        "validation": (X_valid, y_valid),
+        "test": (X_test, y_test),
+    }
+    split_metric_tables = [
+        evaluate_model_on_splits(best_lr_model, split_data, lr_thr, "logistic_regression")
+    ]
+    if HAS_XGBOOST:
+        split_metric_tables.append(
+            evaluate_model_on_splits(xgb_model, split_data, thresholds["xgboost"], "xgboost")
+        )
+    split_metrics = pd.concat(split_metric_tables, ignore_index=True)
+    split_metrics.to_csv(os.path.join(OUTPUT_DIR, "split_comparison_metrics.csv"), index=False)
+
     # 11) Bias and explainability outputs
     save_subgroup_outputs(eval_lr, "logistic_regression", lr_thr)
     save_logistic_coefficients(
@@ -987,6 +1720,8 @@ def main() -> None:
         save_shap_outputs(xgb_model, X_train, X_test, "xgboost")
         save_lime_example(xgb_model, X_train, X_test, "xgboost")
 
+    save_combined_subgroup_outputs(eval_datasets, thresholds)
+
     # Save config
     config = {
         "data_path": DATA_PATH,
@@ -996,7 +1731,12 @@ def main() -> None:
         "categorical_cols": CATEGORICAL_COLS,
         "leakage_cols": LEAKAGE_COLS,
         "subgroup_cols": SUBGROUP_COLS,
+        "value_labels": VALUE_LABELS,
         "thresholds": thresholds,
+        "model_artifacts": {
+            "logistic_regression": lr_model_path,
+            "xgboost": xgb_model_path if HAS_XGBOOST else None,
+        },
         "random_state": RANDOM_STATE,
         "has_xgboost": HAS_XGBOOST,
         "has_shap": HAS_SHAP,
@@ -1028,12 +1768,14 @@ def main() -> None:
         })
         log_metrics_to_mlflow(results)
         log_artifact_to_mlflow(os.path.join(OUTPUT_DIR, "model_comparison_metrics.csv"))
+        log_artifact_to_mlflow(os.path.join(OUTPUT_DIR, "split_comparison_metrics.csv"))
         log_artifact_to_mlflow(os.path.join(OUTPUT_DIR, "hyperparameter_sweep_results.csv"))
         log_artifact_to_mlflow(os.path.join(OUTPUT_DIR, "run_config.json"))
         log_directory_to_mlflow(EDA_DIR, "eda")
         log_directory_to_mlflow(FIGURE_DIR, "figures")
         log_directory_to_mlflow(BIAS_DIR, "bias")
         log_directory_to_mlflow(EXPLAIN_DIR, "explainability")
+        log_directory_to_mlflow(MODEL_DIR, "models")
         mlflow.end_run()
 
     print(f"\nDone. Outputs saved to: {OUTPUT_DIR}")
